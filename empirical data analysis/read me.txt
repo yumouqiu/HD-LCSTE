@@ -1,0 +1,3 @@
+(1) The full dataset can be found from the website http://www.nber.org/oregon/ with the permission from the manager. We only provide data from one subgroup (females with age>=50 years) to illustrate our methods.  
+
+(2) The file "age5064female_mcs8.R" "age5064female_pcs8.R" are used to replicate columns "MCS" and "PCS" in Table 2 for females with age>= 50 years respectively.

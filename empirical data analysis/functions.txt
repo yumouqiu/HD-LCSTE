@@ -1,0 +1,122 @@
+Kappa.D1 = function(z, d, a){
+#--- The first order derivative function of kappa0 ---
+	return(((z - d) * a^2 + z * (d - 1) * (2 * a - 1)) / ((a^2 - a)^2))
+}
+
+SoftThreshold = function(z, lambda){
+#--- Soft thresholding function ---
+if (z > lambda){
+	return (z - lambda)
+} else if (z < -lambda){ 
+	return (z + lambda)
+} else{
+      return (0)
+}
+}
+
+SoftThresholdVector = function(z, lambda){
+#--- Soft thresholding function for vector input ---
+zout = rep(0, length(z))
+zout[which(z > lambda)] = z[which(z > lambda)] - lambda
+zout[which(z < -lambda)] = z[which(z < -lambda)] + lambda
+return(zout)
+}
+
+L1ball = function(z, a){
+#--- Projecting z onto the L1 ball of radius a ---
+z.pos = abs(z)
+if (sum(z.pos) <= a) zout = z
+if (sum(z.pos) > a){
+	z.pos.sort = sort(z.pos, decreasing = TRUE)
+	z1 = c()
+	for (i in 1 : length(z)){
+		z1[i] = z.pos.sort[i] - mean(z.pos.sort[1 : i]) + a / i
+	}
+	i0 = max(which(z1 > 0))
+	theta = mean(z.pos.sort[1 : i0]) - a / i0
+	zout1 = pmax(z.pos - theta, rep(0, length(z)))
+	zout = sign(z) * zout1
+}
+return(zout)
+}
+
+#--- Projected gradient descent ---
+
+glmnet.PGD = function(X, Y, weights, lambda, rho, beta.ini, rate, max.iter = 10^3, tol = 10^(-3) ){
+weights1 = weights
+n = dim(X)[1]; p = dim(X)[2]
+Y = as.vector(Y)
+beta = beta.ini
+#beta0 = beta0.ini
+obj = mean(weights1 * (Y - as.vector(X %*% beta))^2) / 2 + lambda * sum(abs(beta[2 : p]))
+
+Gamma1 = 0
+gamma1 = 0
+for (i in 1 : n){
+	Gamma1 = Gamma1 + weights1[i] * matrix(X[i, ], p, 1) %*% matrix(X[i, ], 1, p)
+	gamma1 = gamma1 + weights1[i] * Y[i] * matrix(X[i, ], p, 1)
+}
+Gamma1 = Gamma1 / n
+gamma1 = gamma1 / n
+
+for (iter in 1 : max.iter){
+	beta.last = beta
+	beta = beta - rate * (Gamma1 %*% beta - gamma1)
+	beta[2 : p] = SoftThresholdVector(as.vector(beta[2 : p]), rate * lambda)
+	if (sum(abs(beta)) > rho){
+		beta = L1ball(beta, rho)
+	}
+	obj[iter + 1] = mean(weights1 * (Y - as.vector(X %*% beta))^2) / 2 + lambda * sum(abs(beta[2 : p]))
+	if ((abs(obj[iter + 1] - obj[iter]) / obj[1] < tol) & (obj[iter + 1] > 0)) {
+		return(list(slope = beta, alpha = 0, step.convergence = iter, step.obj = obj))
+		break
+	} 
+	if ((obj[iter + 1] <= 0) # | ((obj[iter + 1] - obj[iter]) > 0) 
+	) {
+		return(list(slope = beta.last, alpha = 0, step.convergence = iter, step.obj = obj))
+		break
+	} 
+	if (iter == max.iter) {
+	  return(list(slope = beta.last, alpha = 0, step.convergence = iter, step.obj = obj))
+	}
+}
+}
+
+#--- end ---
+
+#--- Projected gradient descent with cross validation ---
+
+glmnet.PGD.cv = function(X, Y, weights, lambda, rho, beta.ini, rate = 1, max.iter = 10^3, tol = 10^(-3), cv.fold = 5){
+# lambda is a range of possible values
+# rho is a range of possible values
+n = dim(X)[1]; p = dim(X)[2]
+index = sample(1 : n)
+cv.test.num = n / cv.fold
+MSE = array(0, c(cv.fold, length(lambda), length(rho)))
+for (i in 1 : cv.fold){
+  index.test = ((i - 1) * cv.test.num + 1)  : (i * cv.test.num)
+  X.train = X[-index.test, ]
+  X.test = X[index.test, ]
+  Y.train = Y[-index.test]
+  Y.test = Y[index.test]
+  for (j in 1 : length(lambda)){
+    for (k in 1 : length(rho)){
+      rho0 = rho[k]
+      lambda0 = lambda[j]
+      res = glmnet.PGD(X = X.train, Y = Y.train, weights = weights[-index.test], lambda = lambda0, rho = rho0, beta.ini = beta.ini, rate = rate, max.iter = max.iter, tol = tol)
+      beta.est = res$slope
+      MSE[i, j, k] = mean(weights[index.test] * (Y.test - as.vector(X.test %*% beta.est))^2) / 2 # + lambda0 * sum(abs(beta.est[2 : p]))
+    }
+  }
+}
+lambda.rho.mean = apply(MSE, c(2, 3), mean)
+lambda.rho.cv.index = which(lambda.rho.mean == min(lambda.rho.mean), arr.ind = TRUE)
+lambda.cv = lambda[lambda.rho.cv.index[1, 1]]
+rho.cv = rho[lambda.rho.cv.index[1, 2]]
+res.cv = glmnet.PGD(X = X, Y = Y, weights = weights, lambda = lambda.cv, rho = rho.cv, beta.ini = beta.ini, rate = rate, max.iter = max.iter, tol = tol)
+res.cv$lambda = lambda.cv
+res.cv$rho = rho.cv
+return(res.cv)
+}
+
+#--- end ---
