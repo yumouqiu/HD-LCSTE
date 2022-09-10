@@ -1,0 +1,345 @@
+Kappa.D1 = function(z, d, a){
+#--- The first order derivative function of kappa0 ---
+	return(((z - d) * a^2 + z * (d - 1) * (2 * a - 1)) / ((a^2 - a)^2))
+}
+
+SoftThreshold = function(z, lambda){
+#--- Soft thresholding function ---
+if (z > lambda){
+	return (z - lambda)
+} else if (z < -lambda){ 
+	return (z + lambda)
+} else{
+      return (0)
+}
+}
+
+SoftThresholdVector = function(z, lambda){
+#--- Soft thresholding function for vector input ---
+zout = rep(0, length(z))
+zout[which(z > lambda)] = z[which(z > lambda)] - lambda
+zout[which(z < -lambda)] = z[which(z < -lambda)] + lambda
+return(zout)
+}
+
+L1ball = function(z, a){
+#--- Projecting z onto the L1 ball of radius a ---
+z.pos = abs(z)
+if (sum(z.pos) <= a) zout = z
+if (sum(z.pos) > a){
+	z.pos.sort = sort(z.pos, decreasing = TRUE)
+	z1 = c()
+	for (i in 1 : length(z)){
+		z1[i] = z.pos.sort[i] - mean(z.pos.sort[1 : i]) + a / i
+	}
+	i0 = max(which(z1 > 0))
+	theta = mean(z.pos.sort[1 : i0]) - a / i0
+	zout1 = pmax(z.pos - theta, rep(0, length(z)))
+	zout = sign(z) * zout1
+}
+return(zout)
+}
+
+#--- Projected gradient descent ---
+
+glmnet.PGD = function(X, Y, weights, lambda, rho, beta.ini, rate, max.iter = 10^3, tol = 10^(-3) ){
+weights1 = weights
+n = dim(X)[1]; p = dim(X)[2]
+Y = as.vector(Y)
+beta = beta.ini
+#beta0 = beta0.ini
+obj = mean(weights1 * (Y - as.vector(X %*% beta))^2) / 2 + lambda * sum(abs(beta[2 : p]))
+
+Gamma1 = 0
+gamma1 = 0
+for (i in 1 : n){
+	Gamma1 = Gamma1 + weights1[i] * matrix(X[i, ], p, 1) %*% matrix(X[i, ], 1, p)
+	gamma1 = gamma1 + weights1[i] * Y[i] * matrix(X[i, ], p, 1)
+}
+Gamma1 = Gamma1 / n
+gamma1 = gamma1 / n
+
+for (iter in 1 : max.iter){
+	beta.last = beta
+	beta = beta - rate * (Gamma1 %*% beta - gamma1)
+	beta[2 : p] = SoftThresholdVector(as.vector(beta[2 : p]), rate * lambda)
+	if (sum(abs(beta)) > rho){
+		beta = L1ball(beta, rho)
+	}
+	obj[iter + 1] = mean(weights1 * (Y - as.vector(X %*% beta))^2) / 2 + lambda * sum(abs(beta[2 : p]))
+	if ((abs(obj[iter + 1] - obj[iter]) / obj[1] < tol) & (obj[iter + 1] > 0)) {
+		return(list(slope = beta, alpha = 0, step.convergence = iter, step.obj = obj))
+		break
+	} 
+	if ((obj[iter + 1] <= 0) 
+	) {
+		return(list(slope = beta.last, alpha = 0, step.convergence = iter, step.obj = obj))
+		break
+	} 
+	if (iter == max.iter) {
+	  return(list(slope = beta.last, alpha = 0, step.convergence = iter, step.obj = obj))
+	}
+}
+}
+
+#--- Projected gradient descent with cross validation ---
+
+glmnet.PGD.cv = function(X, Y, weights, lambda, rho, beta.ini, rate = 1, max.iter = 10^3, tol = 10^(-3), cv.fold = 5){
+# lambda is a range of possible values
+# rho is a range of possible values
+n = dim(X)[1]; p = dim(X)[2]
+index = sample(1 : n)
+cv.test.num = n / cv.fold
+MSE = array(0, c(cv.fold, length(lambda), length(rho)))
+for (i in 1 : cv.fold){
+  index.test = ((i - 1) * cv.test.num + 1)  : (i * cv.test.num)
+  X.train = X[-index.test, ]
+  X.test = X[index.test, ]
+  Y.train = Y[-index.test]
+  Y.test = Y[index.test]
+  for (j in 1 : length(lambda)){
+    for (k in 1 : length(rho)){
+      rho0 = rho[k]
+      lambda0 = lambda[j]
+      res = glmnet.PGD(X = X.train, Y = Y.train, weights = weights[-index.test], lambda = lambda0, rho = rho0, beta.ini = beta.ini, rate = rate, max.iter = max.iter, tol = tol)
+      beta.est = res$slope
+      MSE[i, j, k] = mean(weights[index.test] * (Y.test - as.vector(X.test %*% beta.est))^2) / 2 # + lambda0 * sum(abs(beta.est[2 : p]))
+    }
+  }
+}
+lambda.rho.mean = apply(MSE, c(2, 3), mean)
+lambda.rho.cv.index = which(lambda.rho.mean == min(lambda.rho.mean), arr.ind = TRUE)
+lambda.cv = lambda[lambda.rho.cv.index[1, 1]]
+rho.cv = rho[lambda.rho.cv.index[1, 2]]
+res.cv = glmnet.PGD(X = X, Y = Y, weights = weights, lambda = lambda.cv, rho = rho.cv, beta.ini = beta.ini, rate = rate, max.iter = max.iter, tol = tol)
+res.cv$lambda = lambda.cv
+res.cv$rho = rho.cv
+return(res.cv)
+}
+
+#--- end ---
+#
+#--- Function for the proposed method ---
+
+TwoStageReg.Proposed = function(Xcov, Y, D, Z, beta.initial, s.limit = 10, lambda.second, L1bound, lambda.clime, threshold.q = 0.9, distr.quantile = 1.96){
+# Xcov is the covariates; Y is the responses; D is the treatment; Z is the instrument variable; 
+# beta.initial is the initial value for the second stage estimation algorithm;
+# s.limit is the maximum number of nonzero coefficients used in the nodewise regression in the first stage inference; 
+# lambda.second is the set of the Lasso parameters (for cross validation) used in the second stage regression;
+# L1bound is the bound on L1 norm of beta in the second stage regression;
+# lambda.clime is the tuning parameter in CLIME for the second stage inference;
+# threshold.q is quantile used to regularize the N_gamma matrix for the second stage inference;
+# distr.quantile is the distribution constant for confidence interval, the default is 95% confidence level;
+
+n = dim(Xcov)[1]; p = dim(Xcov)[2]
+x1= Xcov
+z = Z
+X = cbind(D, x1)
+
+fit.bin.1 = cv.glmnet(x1, z, alpha = 1, family = "binomial", intercept = FALSE)
+lambda1 = fit.bin.1$lambda.min
+fit.bin = glmnet(x1, z, alpha = 1, family = "binomial", lambda = lambda1, intercept = FALSE)
+gamma.est.sparse = fit.bin$beta
+
+prob.est = exp(x1 %*% gamma.est.sparse) / (1 + exp(x1 %*% gamma.est.sparse))
+prob.est[prob.est > (1 - 1 / sqrt(n))] = 1 - 1 / sqrt(n)
+prob.est[prob.est < 1 / sqrt(n)] = 1 / sqrt(n)
+weight0 = prob.est * (1 - prob.est)
+
+Theta = matrix(1, p, p)
+for (j in 1 : p){
+	fit.nodewise.1 = glmnet(x1[, -j], x1[, j], alpha = 1, weights = weight0, family = "gaussian", intercept = FALSE)
+	temp1.nodewise = length(fit.nodewise.1$df[fit.nodewise.1$df <= s.limit])
+	lambda1.nodewise = fit.nodewise.1$lambda[temp1.nodewise]
+	fit.nodewise = glmnet(x1[, -j], x1[, j], alpha = 1, weights = weight0, family = "gaussian", lambda = lambda1.nodewise, intercept = FALSE)
+	gamma.nodewise.est = fit.nodewise$beta
+	if (j == 1) gamma.nodewise.row = c(1, -as.vector(gamma.nodewise.est))
+	if (j == p) gamma.nodewise.row = c(-as.vector(gamma.nodewise.est), 1)
+	if (j >= 2 & j < p) gamma.nodewise.row = c(-as.vector(gamma.nodewise.est)[1 : (j - 1)], 1, -as.vector(gamma.nodewise.est)[j : (p - 1)])
+	tau = sum(weight0 * (x1[, j] - x1[, -j] %*% gamma.nodewise.est)^2) / n + lambda1.nodewise * sum(abs(gamma.nodewise.est))
+	Theta[j, ] = gamma.nodewise.row / tau
+}
+
+x1w = x1 * as.vector(z - prob.est)
+gamma.est.DBias = as.vector(gamma.est.sparse) + as.vector(Theta %*% matrix(colMeans(x1w), p, 1))
+gamma.var = diag(Theta %*% (t(x1w) %*% x1w / n) %*% t(Theta))
+gamma.stderr = sqrt(gamma.var / n)
+
+kappa0 = (1 - D) * ((1 - z) - (1 - prob.est)) / (prob.est * (1 - prob.est))
+kappa1 = D * (z - prob.est) / (prob.est * (1 - prob.est))
+kappa = kappa0 * (1 - prob.est) + kappa1 * prob.est
+Yc = Y - mean(kappa * Y) / mean(kappa)
+X.mean = colMeans(X * as.vector(kappa)) / mean(kappa)
+Xc = t(t(X) - X.mean)
+
+WSigma = 0
+for (i in 1 : n){
+	 WSigma = WSigma + kappa[i] * matrix(Xc[i, ], p + 1, 1) %*% matrix(Xc[i, ], 1, p + 1)
+}
+WSigma = WSigma / n
+
+fit.second = glmnet.PGD.cv(Xc, Yc, kappa, lambda.second, L1bound, beta.initial, rate = 0.01) 
+beta.est.1 = fit.second$slope
+steps.second = fit.second$step.convergence
+
+WSigma.inv.out = sugm(WSigma, lambda = lambda.clime, method = "clime")
+WSigma.inv = WSigma.inv.out$icov[[1]]
+WSigma.df = WSigma.inv.out$df
+
+Y.pred = mean(kappa * Y) / mean(kappa) + Xc %*% beta.est.1
+residual = Y - Y.pred
+
+W.residual = 0
+N.residual = 0
+for (i in 1 : n){
+	W.residual = W.residual + kappa[i] * residual[i] * as.vector(Xc[i, ])
+	N.residual = N.residual + residual[i] * Kappa.D1(z[i], D[i], prob.est[i]) * prob.est[i] * (1 - prob.est[i]) * matrix(Xc[i, ], p + 1, 1) %*% matrix(x1[i, ], 1, p)
+}
+W.residual  = W.residual / n
+N.residual  = N.residual / n
+
+Est.var.sandwich = 0
+for (i in 1 : n){
+	Est.var.temp = kappa[i] * residual[i] * as.vector(Xc[i, ]) + as.vector(N.residual %*% Theta %*% x1w[i, ])
+	Est.var.sandwich = Est.var.sandwich + matrix(Est.var.temp, p + 1, 1) %*% matrix(Est.var.temp, 1, p + 1)
+}
+Est.var.sandwich = Est.var.sandwich / n
+Est.var = diag(WSigma.inv %*% Est.var.sandwich %*% t(WSigma.inv))
+Est.stdErr = sqrt(Est.var / n)
+
+beta.est.DBias = beta.est.1 + as.vector(WSigma.inv %*% W.residual - WSigma.inv %*% N.residual %*% (as.vector(gamma.est.sparse) - gamma.est.DBias))
+lower = beta.est.DBias - distr.quantile * Est.stdErr
+upper = beta.est.DBias + distr.quantile * Est.stdErr
+
+threshold.1 = quantile(abs(N.residual), threshold.q, names = FALSE)
+N.residual.threshold = N.residual
+N.residual.threshold[abs(N.residual.threshold) < threshold.1] = 0
+
+Est.var.sandwich.threshold = 0
+for (i in 1 : n){
+  Est.var.temp.threshold = kappa[i] * residual[i] * as.vector(Xc[i, ]) + as.vector(N.residual.threshold %*% Theta %*% x1w[i, ])
+  Est.var.sandwich.threshold = Est.var.sandwich.threshold + matrix(Est.var.temp.threshold, p + 1, 1) %*% matrix(Est.var.temp.threshold, 1, p + 1)
+}
+Est.var.sandwich.threshold = Est.var.sandwich.threshold / n
+Est.var.threshold = diag(WSigma.inv %*% Est.var.sandwich.threshold %*% t(WSigma.inv))
+Est.stdErr.threshold = sqrt(Est.var.threshold / n)
+
+beta.est.DBias.threshold = beta.est.1 + as.vector(WSigma.inv %*% W.residual - WSigma.inv %*% N.residual.threshold %*% (as.vector(gamma.est.sparse) - gamma.est.DBias))
+lower.threshold = beta.est.DBias.threshold - distr.quantile * Est.stdErr.threshold
+upper.threshold = beta.est.DBias.threshold + distr.quantile * Est.stdErr.threshold
+
+res = list(res.CI.Nonthreshold = cbind(beta.est.DBias, lower, upper), res.test.Nonthreshold = beta.est.DBias / Est.stdErr, 
+res.CI.Threshold = cbind(beta.est.DBias.threshold, lower.threshold, upper.threshold), res.test.Threshold = beta.est.DBias.threshold / Est.stdErr.threshold, Est.lasso = beta.est.1,
+steps = steps.second, clime.df = WSigma.df)
+return(res)
+}
+
+
+#-----------------------------------------------------------------
+
+TwoStageReg.Unweighted.Lasso = function(Xcov, Y, D, Z, beta.initial, lambda.second, lambda.clime, distr.quantile = 1.96){
+# function for the unweighted de-sparsified Lasso estimation and inference (uwlasso method); 
+# Xcov is the covariates; Y is the responses; D is the treatment; Z is the instrument variable;
+# beta.initial is the initial value for the estimation algorithm;
+# lambda.second is the set of the Lasso parameters for cross validation;
+# lambda.clime is the tuning parameter in CLIME for estimating the inverse of the design matrix;
+# distr.quantile is the distribution constant for confidence interval, the default is 95% confidence level;
+
+n = dim(Xcov)[1]; p = dim(Xcov)[2]
+x1= Xcov
+z = Z
+X = cbind(D, x1)
+Yc = Y - mean(Y)
+Xc = t(t(X) - colMeans(X))
+
+fit.unweight = glmnet.PGD.cv(Xc, Yc, rep(1, n), lambda.second, p, beta.initial, rate = 0.01) 
+beta.est.UNWLasso = fit.unweight$slope
+
+Sigma.unweight = t(Xc) %*% Xc / n
+Sigma.unweight.inv.out = sugm(Sigma.unweight, lambda = lambda.clime, method = "clime")
+Sigma.unweight.inv = Sigma.unweight.inv.out$icov[[1]]
+
+Y.pred.unweight = mean(Y) + Xc %*% beta.est.UNWLasso
+residual.unweight = Y - Y.pred.unweight
+
+Est.var.unweight.sandwich = 0
+for (i in 1 : n){
+	Est.var.unweight.temp = residual.unweight[i] * as.vector(Xc[i, ])	
+	Est.var.unweight.sandwich = Est.var.unweight.sandwich + matrix(Est.var.unweight.temp, p + 1, 1) %*% matrix(Est.var.unweight.temp, 1, p + 1)
+}
+Est.var.unweight.sandwich = Est.var.unweight.sandwich / n
+Est.var.unweight = diag(Sigma.unweight.inv %*% Est.var.unweight.sandwich %*% t(Sigma.unweight.inv))
+Est.stdErr.unweight = sqrt(Est.var.unweight / n)
+
+beta.est.DBias.unweight = beta.est.UNWLasso + Sigma.unweight.inv %*% t(Xc) %*% residual.unweight / n
+lower.unweight = beta.est.DBias.unweight - distr.quantile * Est.stdErr.unweight
+upper.unweight = beta.est.DBias.unweight + distr.quantile * Est.stdErr.unweight
+
+res = list(res.CI = cbind(beta.est.DBias.unweight, lower.unweight, upper.unweight), res.test = beta.est.DBias.unweight / Est.stdErr.unweight)
+return(res)
+}
+
+
+#-----------------------------------------------------------------
+
+DML = function(Xcov, Y, D, Z, distr.quantile = 1.96){
+# function for the method of Belloni et al. (2017);
+# Xcov is the covariates; Y is the responses; D is the treatment; Z is the instrument variable;
+# distr.quantile is the distribution constant for confidence interval, the default is 95% confidence level;
+
+n = dim(Xcov)[1]; p = dim(Xcov)[2]
+x1= Xcov
+z = as.vector(Z)
+Y = as.vector(Y)
+D = as.vector(D)
+
+fit.bin.1 = cv.glmnet(x1, z, alpha = 1, family = "binomial", intercept = FALSE)
+lambda1 = fit.bin.1$lambda.min
+fit.bin = glmnet(x1, z, alpha = 1, family = "binomial", lambda = lambda1, intercept = FALSE)
+gamma.est.sparse = fit.bin$beta
+prob.est = as.vector(exp(x1 %*% gamma.est.sparse) / (1 + exp(x1 %*% gamma.est.sparse)))
+
+Iz1 = (z == 1)
+Iz0 = (z == 0)
+Yz1 = Y[Iz1]; Yz0 = Y[Iz0]
+Dz1 = D[Iz1]; Dz0 = D[Iz0]
+xz1 = x1[Iz1, ]; xz0 = x1[Iz0, ]
+
+fit.Y1.1 = cv.glmnet(xz1, Yz1, alpha = 1, family = "gaussian", standardize = FALSE, intercept = TRUE)
+lambda1.Y1 = fit.Y1.1$lambda.min
+fit.Y1 = glmnet(xz1, Yz1, alpha = 1, lambda = lambda1.Y1, family = "gaussian", standardize = FALSE, intercept = TRUE)
+Y1.fitted = as.vector(fit.Y1$a0 + x1 %*% fit.Y1$beta)
+
+fit.Y0.1 = cv.glmnet(xz0, Yz0, alpha = 1, family = "gaussian", standardize = FALSE, intercept = TRUE)
+lambda1.Y0 = fit.Y0.1$lambda.min
+fit.Y0 = glmnet(xz0, Yz0, alpha = 1, lambda = lambda1.Y0, family = "gaussian", standardize = FALSE, intercept = TRUE)
+Y0.fitted = as.vector(fit.Y0$a0 + x1 %*% fit.Y0$beta)
+
+if (sum(Dz1 == 0) > 2){
+  fit.D1.1 = cv.glmnet(xz1, Dz1, alpha = 1, family = "binomial", intercept = TRUE)
+  lambda1.D1 = fit.D1.1$lambda.min
+  fit.D1 = glmnet(xz1, Dz1, alpha = 1, family = "binomial", lambda = lambda1.D1, intercept = TRUE)
+  D1.fitted = as.vector(exp(fit.D1$a0 + x1 %*% fit.D1$beta) / (1 + exp(fit.D1$a0 + x1 %*% fit.D1$beta)))
+} else {D1.fitted = rep(1, n)}
+
+if (sum(Dz0 == 1) > 2){
+  fit.D0.1 = cv.glmnet(xz0, Dz0, alpha = 1, family = "binomial", intercept = TRUE)
+  lambda1.D0 = fit.D0.1$lambda.min
+  fit.D0 = glmnet(xz0, Dz0, alpha = 1, family = "binomial", lambda = lambda1.D0, intercept = TRUE)
+  D0.fitted = as.vector(exp(fit.D0$a0 + x1 %*% fit.D0$beta) / (1 + exp(fit.D0$a0 + x1 %*% fit.D0$beta)))
+} else {D0.fitted = rep(0, n)}
+
+num = Y1.fitted - Y0.fitted + z * (Y - Y1.fitted) / prob.est - (1 - z) * (Y - Y0.fitted) / (1 - prob.est)
+den = D1.fitted - D0.fitted + z * (D - D1.fitted) / prob.est - (1 - z) * (D - D0.fitted) / (1 - prob.est)
+est = mean(num) / mean(den)
+
+std = sqrt(sum((num / mean(den) - est)^2) / (n * (n - 1)))
+lower = est - distr.quantile * std
+upper = est + distr.quantile * std
+
+res = list(res.CI = c(est, lower, upper), res.test = est / std)
+return(res)
+}
+
+#-----------------------------------------------------------------
+

@@ -1,0 +1,451 @@
+main1 = function(n, p, rho.X, sigma.X, s1, gamma1, gamma0, epsilon.rho, alpha, s2, beta1.true, R.number, D.beta1 = 0.5, delta.D1 = 1){
+# main function to run the simulation for DGP1;
+# N: sample size; p: dimension; R.number: total number of repetition; rho.X: AR correlation of covariates;
+# sigma.X: variance of covariates; D.beta1: regression coefficients of the first s1 covariates in X on D1 and D0; delta.D1: difference between D0 and D1;   
+# s1: number of nonzero coefficients of X on Z; gamma1: nonzero coefficients of X on Z; gamma0: intercept of Z;
+# epsilon.rho: endogenous correlation of the errors
+# alpha: treatment effect; s2: number of nonzero coefficients of X on Y; beta1.true: nonzero coefficients of X on Y
+
+Correlation.X = matrix(1, p, p)
+for (i in 1 : p){
+	for (j in 1 : p){
+		Correlation.X[i, j] = rho.X^(abs(i - j))
+	}
+}
+Sigma.X = diag(rep(sqrt(sigma.X), p)) %*% Correlation.X %*% diag(rep(sqrt(sigma.X), p))
+
+Steps = c(); clime.df = c()
+CI.Threshold = list(); Test.Threshold = c()
+CI.Unweighted.Lasso = list(); Test.Unweighted.Lasso = c()
+CI.DML = matrix(0, R.number, 3); Test.DML = c()
+
+Est.diff.trt.Threshold = c(); Est.diff.signal.Threshold = c(); Est.diff.zero.Threshold = c()
+Est.diff.trt.Unweighted.Lasso = c(); Est.diff.signal.Unweighted.Lasso = c(); Est.diff.zero.Unweighted.Lasso = c()
+FPR.lasso = c(); FNR.lasso = c()
+Est.diff.trt.DML = c()
+
+coverMean.signal.Threshold = c(); lengthMean.signal.Threshold = c(); coverMean.zero.Threshold = c(); lengthMean.zero.Threshold = c()
+FPR.Threshold = c(); FNR.Threshold = c(); Ttrt.Threshold = c(); cover.trt.Threshold = c(); length.trt.Threshold = c()
+coverMean.signal.Unweighted.Lasso = c(); lengthMean.signal.Unweighted.Lasso = c(); coverMean.zero.Unweighted.Lasso = c(); lengthMean.zero.Unweighted.Lasso = c()
+FPR.Unweighted.Lasso = c(); FNR.Unweighted.Lasso = c(); Ttrt.Unweighted.Lasso = c(); cover.trt.Unweighted.Lasso = c(); length.trt.Unweighted.Lasso = c()
+cover.trt.DML = c(); length.trt.DML = c(); Ttrt.DML = c()
+
+for (iteration in 1 : R.number){
+	x1 = mvrnorm(n, mu = rep(0, p), Sigma = Sigma.X)
+
+	gamma = matrix(c(rep(gamma1, s1), rep(0, p - s1)), p, 1)
+	prob = exp(gamma0 + x1 %*% gamma) / (1 + exp(gamma0 + x1 %*% gamma))
+	uniform = runif(n, 0, 1)
+	z = 1 * (uniform < as.vector(prob))
+
+	D.beta = matrix(c(rep(D.beta1, s1), rep(0, p - s1)), p, 1)
+	epsilon.Sigma = matrix(1, 3, 3)
+	for (i in 1 : 3){
+		for (j in 1 : 3){
+			if (i != j) epsilon.Sigma[i, j] = epsilon.rho
+		}
+	}
+	epsilon.Sigma[1, 2] = 0
+	epsilon.Sigma[2, 1] = 0
+	epsilonD1 = c()
+	epsilonD0 = c()
+	epsilonY = c()
+	for (i in 1 : n){
+		epsilon.temp = mvrnorm(n = 1, mu = rep(0, 3), Sigma = epsilon.Sigma)
+		epsilonD1[i] = epsilon.temp[1]
+		epsilonD0[i] = epsilon.temp[2]
+		epsilonY[i] = epsilon.temp[3]
+	}
+
+	D1 = 1 * (delta.D1 + x1 %*% D.beta + epsilonD1 >= 0)
+	D0 = 1 * (- delta.D1 + x1 %*% D.beta + epsilonD0 >= 0)
+	D1 = pmax(D1, D0)
+	D = as.vector(z) * D1 + (1 - as.vector(z)) * D0
+
+	epsilon = rnorm(n, 0, 1)
+	epsilonY[D0 < D1] = epsilon[D0 < D1]
+
+	beta1 = rep(beta1.true, s2)
+	beta.true = c(alpha, beta1, rep(0, p - length(beta1)))
+	y = alpha * D + x1 %*% beta.true[-1] + epsilonY
+
+	index.signal = which(beta.true != 0)
+	index.zero = which(beta.true == 0)
+
+	lambda.second.range = seq(0.5 * sqrt(s1 * log(p) / n), 3 * sqrt(s1 * log(p) / n), 0.05)
+	beta.initial = beta.true
+	
+	Res = TwoStageReg.Proposed(Xcov = x1, Y = y, D = D, Z = z, beta.initial = beta.initial, 
+	s.limit = sum(gamma != 0) + 3, lambda.second = lambda.second.range, L1bound = seq(1, sqrt(n), 2), 
+	lambda.clime = 2 * sqrt(log(p) / n), distr.quantile = 1.96)
+	Steps = c(Steps, Res$steps)
+	clime.df = cbind(clime.df, Res$clime.df)
+
+	significant.lasso = which(Res$Est.lasso != 0)
+	FPR.lasso[iteration] = length(intersect(significant.lasso, index.zero)) / (length(significant.lasso) + 0.00001)
+	FNR.lasso[iteration] = (length(index.signal) - length(intersect(significant.lasso, index.signal))) / length(index.signal)
+
+	CI.Threshold[[iteration]] = Res$res.CI.Threshold
+	Test.Threshold = cbind(Test.Threshold, Res$res.test.Threshold)
+
+	Est.diff.Threshold = as.vector(Res$res.CI.Threshold[, 1] - beta.true)
+	Est.diff.trt.Threshold[iteration] = Est.diff.Threshold[1]
+	Est.diff.signal.Threshold[iteration] = mean(Est.diff.Threshold[index.signal[-1]]^2)
+	Est.diff.zero.Threshold[iteration] = mean(Est.diff.Threshold[index.zero]^2)
+
+	cover.signal.Threshold = c()
+	length.signal.Threshold = c()
+	for (k in 1 : length(index.signal)){
+		index.temp = index.signal[k]
+		CI.temp = CI.Threshold[[iteration]][index.temp, c(2, 3)]
+		cover.signal.Threshold[k] = 1 * ((as.numeric(CI.temp[2] - beta.true[index.temp]) * as.numeric(CI.temp[1] - beta.true[index.temp])) < 0)
+		length.signal.Threshold[k] = as.numeric(CI.temp[2]) - as.numeric(CI.temp[1])
+	}
+	cover.trt.Threshold[iteration] = cover.signal.Threshold[1]
+	length.trt.Threshold[iteration] = length.signal.Threshold[1]
+	coverMean.signal.Threshold[iteration] = mean(cover.signal.Threshold)
+	lengthMean.signal.Threshold[iteration] = mean(length.signal.Threshold)
+
+	cover.zero.Threshold = c()
+	length.zero.Threshold = c()
+	for (k in 1 : length(index.zero)){
+		index.temp = index.zero[k]
+		CI.temp = CI.Threshold[[iteration]][index.temp, c(2, 3)]
+		cover.zero.Threshold[k] = 1 * (as.numeric(CI.temp[2]) * as.numeric(CI.temp[1]) < 0)
+		length.zero.Threshold[k] = as.numeric(CI.temp[2]) - as.numeric(CI.temp[1])
+	}
+	coverMean.zero.Threshold[iteration] = mean(cover.zero.Threshold)
+	lengthMean.zero.Threshold[iteration] = mean(length.zero.Threshold)
+
+	pv.Threshold = 2 * (1 - pnorm(abs(Test.Threshold[, iteration])))
+	pvsort.Threshold = sort(pv.Threshold)
+	if (sum(pvsort.Threshold <= 0.05 * c(1 : (p + 1)) / (p + 1)) == 0) significant.Threshold = c()
+	if (sum(pvsort.Threshold <= 0.05 * c(1 : (p + 1)) / (p + 1)) > 0) {
+		cutoff1.Threshold = max(which(1 * (pvsort.Threshold <= 0.05 * c(1 : (p + 1)) / (p + 1)) == 1))
+		cutoff2.Threshold = pvsort.Threshold[cutoff1.Threshold]
+		significant.Threshold = which(pv.Threshold <= cutoff2.Threshold)
+	}
+	FP.Threshold = length(intersect(significant.Threshold, index.zero))
+	TN.Threshold = length(intersect(significant.Threshold, index.signal))
+	FN.Threshold = length(index.signal) - TN.Threshold
+	FPR.Threshold[iteration] = FP.Threshold / (length(significant.Threshold) + 0.00001)
+	FNR.Threshold[iteration] = FN.Threshold / length(index.signal)
+	Ttrt.Threshold[iteration] = 1 * (1 %in% significant.Threshold)
+
+	Res.Unweighted.Lasso = TwoStageReg.Unweighted.Lasso(Xcov = x1, Y = y, D = D, Z = z, beta.initial = beta.initial, lambda.second = lambda.second.range, 
+	lambda.clime = 2 * sqrt(log(p) / n), distr.quantile = 1.96)
+	CI.Unweighted.Lasso[[iteration]] = Res.Unweighted.Lasso$res.CI
+	Test.Unweighted.Lasso = cbind(Test.Unweighted.Lasso, as.vector(Res.Unweighted.Lasso$res.test))
+
+	Est.diff.Unweighted.Lasso = as.vector(Res.Unweighted.Lasso$res.CI[, 1] - beta.true)
+	Est.diff.trt.Unweighted.Lasso[iteration] = Est.diff.Unweighted.Lasso[1]
+	Est.diff.signal.Unweighted.Lasso[iteration] = mean(Est.diff.Unweighted.Lasso[index.signal[-1]]^2)
+	Est.diff.zero.Unweighted.Lasso[iteration] = mean(Est.diff.Unweighted.Lasso[index.zero]^2)
+
+	cover.signal.Unweighted.Lasso = c()
+	length.signal.Unweighted.Lasso = c()
+	for (k in 1 : length(index.signal)){
+		index.temp = index.signal[k]
+		CI.temp = CI.Unweighted.Lasso[[iteration]][index.temp, c(2, 3)]
+		cover.signal.Unweighted.Lasso[k] = 1 * ((as.numeric(CI.temp[2] - beta.true[index.temp]) * as.numeric(CI.temp[1] - beta.true[index.temp])) < 0)
+		length.signal.Unweighted.Lasso[k] = as.numeric(CI.temp[2]) - as.numeric(CI.temp[1])
+	}
+	cover.trt.Unweighted.Lasso[iteration] = cover.signal.Unweighted.Lasso[1]
+	length.trt.Unweighted.Lasso[iteration] = length.signal.Unweighted.Lasso[1]
+	coverMean.signal.Unweighted.Lasso[iteration] = mean(cover.signal.Unweighted.Lasso)
+	lengthMean.signal.Unweighted.Lasso[iteration] = mean(length.signal.Unweighted.Lasso)
+
+	cover.zero.Unweighted.Lasso = c()
+	length.zero.Unweighted.Lasso = c()
+	for (k in 1 : length(index.zero)){
+		index.temp = index.zero[k]
+		CI.temp = CI.Unweighted.Lasso[[iteration]][index.temp, c(2, 3)]
+		cover.zero.Unweighted.Lasso[k] = 1 * (as.numeric(CI.temp[2]) * as.numeric(CI.temp[1]) < 0)
+		length.zero.Unweighted.Lasso[k] = as.numeric(CI.temp[2]) - as.numeric(CI.temp[1])
+	}
+	coverMean.zero.Unweighted.Lasso[iteration] = mean(cover.zero.Unweighted.Lasso)
+	lengthMean.zero.Unweighted.Lasso[iteration] = mean(length.zero.Unweighted.Lasso)
+
+	pv.Unweighted.Lasso = 2 * (1 - pnorm(abs(Test.Unweighted.Lasso[, iteration])))
+	pvsort.Unweighted.Lasso = sort(pv.Unweighted.Lasso)
+	if (sum(pvsort.Unweighted.Lasso <= 0.05 * c(1 : (p + 1)) / (p + 1)) == 0) significant.Unweighted.Lasso = c()
+	if (sum(pvsort.Unweighted.Lasso <= 0.05 * c(1 : (p + 1)) / (p + 1)) > 0) {
+		cutoff1.Unweighted.Lasso = max(which(1 * (pvsort.Unweighted.Lasso <= 0.05 * c(1 : (p + 1)) / (p + 1)) == 1))
+		cutoff2.Unweighted.Lasso = pvsort.Unweighted.Lasso[cutoff1.Unweighted.Lasso]
+		significant.Unweighted.Lasso = which(pv.Unweighted.Lasso <= cutoff2.Unweighted.Lasso)
+	}
+	FP.Unweighted.Lasso = length(intersect(significant.Unweighted.Lasso, index.zero))
+	TN.Unweighted.Lasso = length(intersect(significant.Unweighted.Lasso, index.signal))
+	FN.Unweighted.Lasso = length(index.signal) - TN.Unweighted.Lasso
+	FPR.Unweighted.Lasso[iteration] = FP.Unweighted.Lasso / (length(significant.Unweighted.Lasso) + 0.00001)
+	FNR.Unweighted.Lasso[iteration] = FN.Unweighted.Lasso / length(index.signal)
+	Ttrt.Unweighted.Lasso[iteration] = 1 * (1 %in% significant.Unweighted.Lasso)
+	
+	Res.DML = DML(Xcov = x1[, c(1 : (p / 5))], Y = y, D = D, Z = z, distr.quantile = 1.96)
+	CI.DML[iteration, ] = Res.DML$res.CI
+	Test.DML[iteration] = Res.DML$res.test
+	Est.diff.trt.DML[iteration] = Res.DML$res.CI[1] - alpha
+
+	cover.trt.DML[iteration] = 1 * ((Res.DML$res.CI[2] - alpha) * (Res.DML$res.CI[3] - alpha) < 0)
+	length.trt.DML[iteration] = Res.DML$res.CI[3] - Res.DML$res.CI[2]
+	pv.DML = 2 * (1 - pnorm(abs(Res.DML$res.test)))
+	Ttrt.DML[iteration] = 1 * (pv.DML < 0.05)
+
+	cat("iteration = ", iteration, "\n")
+}
+
+#-- report on 95% CI coverage and length ---
+
+table.CI1 = round(rbind(
+	c(mean(cover.trt.Threshold), sd(cover.trt.Threshold) / sqrt(length(FPR.Threshold)), mean(length.trt.Threshold), sd(length.trt.Threshold) / sqrt(length(FPR.Threshold)), mean(Est.diff.trt.Threshold), 
+mean(coverMean.signal.Threshold), sd(coverMean.signal.Threshold)  / sqrt(length(FPR.Threshold)), mean(lengthMean.signal.Threshold), sd(lengthMean.signal.Threshold) / sqrt(length(FPR.Threshold)), mean(Est.diff.signal.Threshold), 
+mean(coverMean.zero.Threshold), sd(coverMean.zero.Threshold) / sqrt(length(FPR.Threshold)), mean(lengthMean.zero.Threshold), sd(lengthMean.zero.Threshold) / sqrt(length(FPR.Threshold)), mean(Est.diff.zero.Threshold)),  
+
+	c(mean(cover.trt.Unweighted.Lasso), sd(cover.trt.Unweighted.Lasso) / sqrt(length(FPR.Threshold)), mean(length.trt.Unweighted.Lasso), sd(length.trt.Unweighted.Lasso) / sqrt(length(FPR.Threshold)), mean(Est.diff.trt.Unweighted.Lasso), 
+mean(coverMean.signal.Unweighted.Lasso), sd(coverMean.signal.Unweighted.Lasso) / sqrt(length(FPR.Threshold)), mean(lengthMean.signal.Unweighted.Lasso), sd(lengthMean.signal.Unweighted.Lasso) / sqrt(length(FPR.Threshold)), mean(Est.diff.signal.Unweighted.Lasso), 
+mean(coverMean.zero.Unweighted.Lasso), sd(coverMean.zero.Unweighted.Lasso) / sqrt(length(FPR.Threshold)), mean(lengthMean.zero.Unweighted.Lasso), sd(lengthMean.zero.Unweighted.Lasso) / sqrt(length(FPR.Threshold)), mean(Est.diff.zero.Unweighted.Lasso)),
+
+  c(mean(cover.trt.DML), sd(cover.trt.DML) / sqrt(length(FPR.Threshold)), mean(length.trt.DML), sd(length.trt.DML) / sqrt(length(FPR.Threshold)), mean(Est.diff.trt.DML), 
+NA, NA, NA, NA, NA, 
+NA, NA, NA, NA, NA)
+	), 3)
+	
+	table.CI = as.data.frame(table.CI1, row.names = c("Proposed-Threshold", "Unweighted-Lasso", "DML"))
+	names(table.CI) = c("Ave-Trt-Coverage", "StdErr-Trt-Coverage", "Ave-CI.length-Trt", "StdErr-CI.length-Trt", "MSE-Trt",
+"Ave-Signal-Coverage", "StdErr-Signal-Coverage", "Ave-CI.length-Signal", "StdErr-CI.length-Signal", "MSE-Signal",
+"Ave-nonSignal-Coverage", "StdErr-nonSignal-Coverage", "Ave-CI.length-nonSignal", "StdErr-CI.length-nonSignal", "MSE-nonSignal")
+
+return(table.CI)
+}
+
+#-------------------------------------------------------------------------------------------------------
+#
+#-------------------------------------------------------------------------------------------------------
+
+main2 = function(n, p, rho.X, sigma.X, gamma1, gamma0, lambda.NC, alpha, beta1.true, R.number, delta.D1 = 1){
+# main function to run the simulation for DGP2;
+# N: sample size; p: dimension; R.number: total number of repetition; rho.X: AR correlation of covariates;
+# sigma.X: variance of covariates; 
+# (1 / i^2): regression coefficients of X on D1 and D0; delta.D1: difference between D0 and D1;   
+# gamma1: coefficients of X on Z are equal to gamma1 / i^2; gamma0: intercept of Z;
+# lambda.NC = c(lambda00, lambda11): intercepts on the always non-takers and always-takers
+# alpha: treatment effect; beta1.true: coefficients of X on Y are equal to beta1.true / i^2
+
+Correlation.X = matrix(1, p, p)
+for (i in 1 : p){
+	for (j in 1 : p){
+		Correlation.X[i, j] = rho.X^(abs(i - j))
+	}
+}
+Sigma.X = diag(rep(sqrt(sigma.X), p)) %*% Correlation.X %*% diag(rep(sqrt(sigma.X), p))
+
+Steps = c(); clime.df = c()
+CI.Threshold = list(); Test.Threshold = c()
+CI.Unweighted.Lasso = list(); Test.Unweighted.Lasso = c()
+CI.DML = matrix(0, R.number, 3); Test.DML = c()
+
+Est.diff.trt.Threshold = c(); Est.diff.signal.Threshold = c(); Est.diff.zero.Threshold = c()
+Est.diff.trt.Unweighted.Lasso = c(); Est.diff.signal.Unweighted.Lasso = c(); Est.diff.zero.Unweighted.Lasso = c()
+FPR.lasso = c(); FNR.lasso = c()
+Est.diff.trt.DML = c()
+
+coverMean.signal.Threshold = c(); lengthMean.signal.Threshold = c(); coverMean.zero.Threshold = c(); lengthMean.zero.Threshold = c()
+FPR.Threshold = c(); FNR.Threshold = c(); Ttrt.Threshold = c(); cover.trt.Threshold = c(); length.trt.Threshold = c()
+coverMean.signal.Unweighted.Lasso = c(); lengthMean.signal.Unweighted.Lasso = c(); coverMean.zero.Unweighted.Lasso = c(); lengthMean.zero.Unweighted.Lasso = c()
+FPR.Unweighted.Lasso = c(); FNR.Unweighted.Lasso = c(); Ttrt.Unweighted.Lasso = c(); cover.trt.Unweighted.Lasso = c(); length.trt.Unweighted.Lasso = c()
+cover.trt.DML = c(); length.trt.DML = c(); Ttrt.DML = c()
+
+for (iteration in 1 : R.number){
+	x1 = mvrnorm(n, mu = rep(0, p), Sigma = Sigma.X)
+
+	gamma = rep(0, p)
+	for (i in 1 : p){
+	  gamma[i] = gamma1 / i^2
+	}
+	s1 = sum(gamma > 0.02)
+	gamma = matrix(gamma, p, 1)
+	prob = exp(gamma0 + x1 %*% gamma) / (1 + exp(gamma0 + x1 %*% gamma))
+	uniform = runif(n, 0, 1)
+	z = 1 * (uniform < as.vector(prob))
+
+	eta0 = rep(0, p)
+	for (i in 1:p){
+	  eta0[i] = 1 / (i^2)
+	}
+	eta0 = matrix(eta0, p, 1)
+	v1 = rnorm(n, 0, 1)
+	v2 = rnorm(n, 0, 1)
+	D1 = as.numeric(x1 %*% eta0 + delta.D1 + v1 > 0)
+	D0 = as.numeric(x1 %*% eta0 - delta.D1 + v2 > 0)
+	D1 = pmax(D1, D0)
+	D = as.vector(z) * D1 + (1 - as.vector(z)) * D0
+
+	beta = rep(0, p)
+	for (i in 1 : p){
+	  beta[i] = beta1.true / i^2
+	}
+	beta.true = c(alpha, beta)
+	beta = matrix(beta, p, 1)
+	epsilon = rnorm(n, 0, 1)
+	lambda11 = lambda.NC[2]
+	lambda00 = lambda.NC[1]
+	xi1 = alpha + x1 %*% beta + epsilon
+	xi2 = x1 %*% beta + epsilon
+	xi3 = rpois(n, lambda11)
+	xi4 = rpois(n, lambda00)
+	y1 = xi1 + xi3 * as.numeric(D0 == 1 & D1 == 1) + xi4 * as.numeric(D0 == 0 & D1 == 0)
+	y0 = xi2 + xi3 * as.numeric(D0 == 1 & D1 == 1) + xi4 * as.numeric(D0 == 0 & D1 == 0)
+	y = y1 * D + y0 * (1-D)
+
+	index.signal = which(beta.true > 0.02)
+	index.zero = which(beta.true <= 0.02)
+
+	lambda.second.range = seq(0.5 * sqrt(s1 * log(p) / n), 3 * sqrt(s1 * log(p) / n), 0.05)
+	beta.initial = beta.true
+	
+	Res = TwoStageReg.Proposed(Xcov = x1, Y = y, D = D, Z = z, beta.initial = beta.initial, 
+	s.limit = 4, lambda.second = lambda.second.range, L1bound = seq(1, sqrt(n), 2), 
+	lambda.clime = 2 * sqrt(log(p) / n), distr.quantile = 1.96)
+	Steps = c(Steps, Res$steps)
+	clime.df = cbind(clime.df, Res$clime.df)
+
+	significant.lasso = which(Res$Est.lasso != 0)
+	FPR.lasso[iteration] = length(intersect(significant.lasso, index.zero)) / (length(significant.lasso) + 0.00001)
+	FNR.lasso[iteration] = (length(index.signal) - length(intersect(significant.lasso, index.signal))) / length(index.signal)
+
+	CI.Threshold[[iteration]] = Res$res.CI.Threshold
+	Test.Threshold = cbind(Test.Threshold, Res$res.test.Threshold)
+
+	Est.diff.Threshold = as.vector(Res$res.CI.Threshold[, 1] - beta.true)
+	Est.diff.trt.Threshold[iteration] = Est.diff.Threshold[1]
+	Est.diff.signal.Threshold[iteration] = mean(Est.diff.Threshold[index.signal[-1]]^2)
+	Est.diff.zero.Threshold[iteration] = mean(Est.diff.Threshold[index.zero]^2)
+
+	cover.signal.Threshold = c()
+	length.signal.Threshold = c()
+	for (k in 1 : length(index.signal)){
+		index.temp = index.signal[k]
+		CI.temp = CI.Threshold[[iteration]][index.temp, c(2, 3)]
+		cover.signal.Threshold[k] = 1 * ((as.numeric(CI.temp[2] - beta.true[index.temp]) * as.numeric(CI.temp[1] - beta.true[index.temp])) < 0)
+		length.signal.Threshold[k] = as.numeric(CI.temp[2]) - as.numeric(CI.temp[1])
+	}
+	cover.trt.Threshold[iteration] = cover.signal.Threshold[1]
+	length.trt.Threshold[iteration] = length.signal.Threshold[1]
+	coverMean.signal.Threshold[iteration] = mean(cover.signal.Threshold)
+	lengthMean.signal.Threshold[iteration] = mean(length.signal.Threshold)
+
+	cover.zero.Threshold = c()
+	length.zero.Threshold = c()
+	for (k in 1 : length(index.zero)){
+		index.temp = index.zero[k]
+		CI.temp = CI.Threshold[[iteration]][index.temp, c(2, 3)]
+		cover.zero.Threshold[k] = 1 * (as.numeric(CI.temp[2]) * as.numeric(CI.temp[1]) < 0)
+		length.zero.Threshold[k] = as.numeric(CI.temp[2]) - as.numeric(CI.temp[1])
+	}
+	coverMean.zero.Threshold[iteration] = mean(cover.zero.Threshold)
+	lengthMean.zero.Threshold[iteration] = mean(length.zero.Threshold)
+
+	pv.Threshold = 2 * (1 - pnorm(abs(Test.Threshold[, iteration])))
+	pvsort.Threshold = sort(pv.Threshold)
+	if (sum(pvsort.Threshold <= 0.05 * c(1 : (p + 1)) / (p + 1)) == 0) significant.Threshold = c()
+	if (sum(pvsort.Threshold <= 0.05 * c(1 : (p + 1)) / (p + 1)) > 0) {
+		cutoff1.Threshold = max(which(1 * (pvsort.Threshold <= 0.05 * c(1 : (p + 1)) / (p + 1)) == 1))
+		cutoff2.Threshold = pvsort.Threshold[cutoff1.Threshold]
+		significant.Threshold = which(pv.Threshold <= cutoff2.Threshold)
+	}
+	FP.Threshold = length(intersect(significant.Threshold, index.zero))
+	TN.Threshold = length(intersect(significant.Threshold, index.signal))
+	FN.Threshold = length(index.signal) - TN.Threshold
+	FPR.Threshold[iteration] = FP.Threshold / (length(significant.Threshold) + 0.00001)
+	FNR.Threshold[iteration] = FN.Threshold / length(index.signal)
+	Ttrt.Threshold[iteration] = 1 * (1 %in% significant.Threshold)
+
+	Res.Unweighted.Lasso = TwoStageReg.Unweighted.Lasso(Xcov = x1, Y = y, D = D, Z = z, beta.initial = beta.initial, lambda.second = lambda.second.range, 
+	lambda.clime = 2 * sqrt(log(p) / n), distr.quantile = 1.96)
+	CI.Unweighted.Lasso[[iteration]] = Res.Unweighted.Lasso$res.CI
+	Test.Unweighted.Lasso = cbind(Test.Unweighted.Lasso, as.vector(Res.Unweighted.Lasso$res.test))
+
+	Est.diff.Unweighted.Lasso = as.vector(Res.Unweighted.Lasso$res.CI[, 1] - beta.true)
+	Est.diff.trt.Unweighted.Lasso[iteration] = Est.diff.Unweighted.Lasso[1]
+	Est.diff.signal.Unweighted.Lasso[iteration] = mean(Est.diff.Unweighted.Lasso[index.signal[-1]]^2)
+	Est.diff.zero.Unweighted.Lasso[iteration] = mean(Est.diff.Unweighted.Lasso[index.zero]^2)
+
+	cover.signal.Unweighted.Lasso = c()
+	length.signal.Unweighted.Lasso = c()
+	for (k in 1 : length(index.signal)){
+		index.temp = index.signal[k]
+		CI.temp = CI.Unweighted.Lasso[[iteration]][index.temp, c(2, 3)]
+		cover.signal.Unweighted.Lasso[k] = 1 * ((as.numeric(CI.temp[2] - beta.true[index.temp]) * as.numeric(CI.temp[1] - beta.true[index.temp])) < 0)
+		length.signal.Unweighted.Lasso[k] = as.numeric(CI.temp[2]) - as.numeric(CI.temp[1])
+	}
+	cover.trt.Unweighted.Lasso[iteration] = cover.signal.Unweighted.Lasso[1]
+	length.trt.Unweighted.Lasso[iteration] = length.signal.Unweighted.Lasso[1]
+	coverMean.signal.Unweighted.Lasso[iteration] = mean(cover.signal.Unweighted.Lasso)
+	lengthMean.signal.Unweighted.Lasso[iteration] = mean(length.signal.Unweighted.Lasso)
+
+	cover.zero.Unweighted.Lasso = c()
+	length.zero.Unweighted.Lasso = c()
+	for (k in 1 : length(index.zero)){
+		index.temp = index.zero[k]
+		CI.temp = CI.Unweighted.Lasso[[iteration]][index.temp, c(2, 3)]
+		cover.zero.Unweighted.Lasso[k] = 1 * (as.numeric(CI.temp[2]) * as.numeric(CI.temp[1]) < 0)
+		length.zero.Unweighted.Lasso[k] = as.numeric(CI.temp[2]) - as.numeric(CI.temp[1])
+	}
+	coverMean.zero.Unweighted.Lasso[iteration] = mean(cover.zero.Unweighted.Lasso)
+	lengthMean.zero.Unweighted.Lasso[iteration] = mean(length.zero.Unweighted.Lasso)
+
+	pv.Unweighted.Lasso = 2 * (1 - pnorm(abs(Test.Unweighted.Lasso[, iteration])))
+	pvsort.Unweighted.Lasso = sort(pv.Unweighted.Lasso)
+	if (sum(pvsort.Unweighted.Lasso <= 0.05 * c(1 : (p + 1)) / (p + 1)) == 0) significant.Unweighted.Lasso = c()
+	if (sum(pvsort.Unweighted.Lasso <= 0.05 * c(1 : (p + 1)) / (p + 1)) > 0) {
+		cutoff1.Unweighted.Lasso = max(which(1 * (pvsort.Unweighted.Lasso <= 0.05 * c(1 : (p + 1)) / (p + 1)) == 1))
+		cutoff2.Unweighted.Lasso = pvsort.Unweighted.Lasso[cutoff1.Unweighted.Lasso]
+		significant.Unweighted.Lasso = which(pv.Unweighted.Lasso <= cutoff2.Unweighted.Lasso)
+	}
+	FP.Unweighted.Lasso = length(intersect(significant.Unweighted.Lasso, index.zero))
+	TN.Unweighted.Lasso = length(intersect(significant.Unweighted.Lasso, index.signal))
+	FN.Unweighted.Lasso = length(index.signal) - TN.Unweighted.Lasso
+	FPR.Unweighted.Lasso[iteration] = FP.Unweighted.Lasso / (length(significant.Unweighted.Lasso) + 0.00001)
+	FNR.Unweighted.Lasso[iteration] = FN.Unweighted.Lasso / length(index.signal)
+	Ttrt.Unweighted.Lasso[iteration] = 1 * (1 %in% significant.Unweighted.Lasso)
+
+	Res.DML = DML(Xcov = x1[, c(1 : (p / 5))], Y = y, D = D, Z = z, distr.quantile = 1.96)
+	CI.DML[iteration, ] = Res.DML$res.CI
+	Test.DML[iteration] = Res.DML$res.test
+	Est.diff.trt.DML[iteration] = Res.DML$res.CI[1] - alpha
+
+	cover.trt.DML[iteration] = 1 * ((Res.DML$res.CI[2] - alpha) * (Res.DML$res.CI[3] - alpha) < 0)
+	length.trt.DML[iteration] = Res.DML$res.CI[3] - Res.DML$res.CI[2]
+	pv.DML = 2 * (1 - pnorm(abs(Res.DML$res.test)))
+	Ttrt.DML[iteration] = 1 * (pv.DML < 0.05)
+
+	cat("iteration = ", iteration, "\n")
+}
+
+#-- report on 95% CI coverage and length ---
+
+table.CI1 = round(rbind(
+	c(mean(cover.trt.Threshold), sd(cover.trt.Threshold) / sqrt(length(FPR.Threshold)), mean(length.trt.Threshold), sd(length.trt.Threshold) / sqrt(length(FPR.Threshold)), mean(Est.diff.trt.Threshold), 
+mean(coverMean.signal.Threshold), sd(coverMean.signal.Threshold)  / sqrt(length(FPR.Threshold)), mean(lengthMean.signal.Threshold), sd(lengthMean.signal.Threshold) / sqrt(length(FPR.Threshold)), mean(Est.diff.signal.Threshold), 
+mean(coverMean.zero.Threshold), sd(coverMean.zero.Threshold) / sqrt(length(FPR.Threshold)), mean(lengthMean.zero.Threshold), sd(lengthMean.zero.Threshold) / sqrt(length(FPR.Threshold)), mean(Est.diff.zero.Threshold)),  
+
+	c(mean(cover.trt.Unweighted.Lasso), sd(cover.trt.Unweighted.Lasso) / sqrt(length(FPR.Threshold)), mean(length.trt.Unweighted.Lasso), sd(length.trt.Unweighted.Lasso) / sqrt(length(FPR.Threshold)), mean(Est.diff.trt.Unweighted.Lasso), 
+mean(coverMean.signal.Unweighted.Lasso), sd(coverMean.signal.Unweighted.Lasso) / sqrt(length(FPR.Threshold)), mean(lengthMean.signal.Unweighted.Lasso), sd(lengthMean.signal.Unweighted.Lasso) / sqrt(length(FPR.Threshold)), mean(Est.diff.signal.Unweighted.Lasso), 
+mean(coverMean.zero.Unweighted.Lasso), sd(coverMean.zero.Unweighted.Lasso) / sqrt(length(FPR.Threshold)), mean(lengthMean.zero.Unweighted.Lasso), sd(lengthMean.zero.Unweighted.Lasso) / sqrt(length(FPR.Threshold)), mean(Est.diff.zero.Unweighted.Lasso)),
+
+  c(mean(cover.trt.DML), sd(cover.trt.DML) / sqrt(length(FPR.Threshold)), mean(length.trt.DML), sd(length.trt.DML) / sqrt(length(FPR.Threshold)), mean(Est.diff.trt.DML), 
+NA, NA, NA, NA, NA, 
+NA, NA, NA, NA, NA)
+	), 3)
+	
+	table.CI = as.data.frame(table.CI1, row.names = c("Proposed-Threshold", "Unweighted-Lasso", "DML"))
+	names(table.CI) = c("Ave-Trt-Coverage", "StdErr-Trt-Coverage", "Ave-CI.length-Trt", "StdErr-CI.length-Trt", "MSE-Trt",
+"Ave-Signal-Coverage", "StdErr-Signal-Coverage", "Ave-CI.length-Signal", "StdErr-CI.length-Signal", "MSE-Signal",
+"Ave-nonSignal-Coverage", "StdErr-nonSignal-Coverage", "Ave-CI.length-nonSignal", "StdErr-CI.length-nonSignal", "MSE-nonSignal")
+
+return(table.CI)
+}
+
+
+
+
